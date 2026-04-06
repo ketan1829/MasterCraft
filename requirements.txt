@@ -1,0 +1,7 @@
+librosa==0.11.0
+numpy==2.4.4
+openai==2.30.0
+pedalboard==0.9.22
+pyloudnorm==0.2.0
+scipy==1.17.1
+soundfile==0.13.1
