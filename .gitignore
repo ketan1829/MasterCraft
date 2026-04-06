@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment variables (API keys)
+.env
+.env.local
+*.key
+secrets.py
+
+# Large audio files (raw mixes, intermediates)
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.ogg
+*.m4a
+
+# Mastered outputs (optional – comment out if you want to keep them)
+*_mastered.wav
+*_spotify.wav
+*_apple_music.wav
+mastered/
+originals/   # if you don't want to version original files
+
+# Logs and reports
+*.log
+*.json      # optional: remove if you want to keep JSON reports
+
+# Pedalboard / librosa cache
+~/.librosa/
+pedalboard_cache/
+
+# Any temporary files
+*.tmp
+*.temp
