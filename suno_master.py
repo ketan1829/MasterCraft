@@ -135,12 +135,14 @@ def print_report(report: MasteringReport) -> None:
     print(f"\n  {bold('MASTERING CHAIN DECISIONS')}")
     print(f"  {'─'*58}")
 
-    if report.corrective_eq_applied:
-        for m in report.corrective_eq_applied:
-            db_str = f" {m.get('db',0):+.1f}dB" if m.get('type') != 'highpass' else " cut"
-            print(f"  {yellow('Corrective EQ')}  {m.get('type','peak'):>10}  {m['hz']:>6.0f}Hz{db_str}  — {dim(m.get('reason',''))}")
+
+    if report.dyn_eq_bands:
+        for m in report.dyn_eq_bands:
+            print(f"  {yellow('Dynamic EQ')}     {m.get('name',''):<12} {m['hz']:>5.0f}Hz  "
+                f"threshold={m['threshold_db']:>5.1f}dB  "
+                f"avg_cut={m.get('avg_cut',0):>5.2f}dB")
     else:
-        print(f"  {green('Corrective EQ')}   no problem frequencies found")
+        print(f"  {green('Dynamic EQ')}      no bands exceeded threshold")
 
     if r:
         c = r.comp
