@@ -210,11 +210,11 @@ def main():
         help="Save full JSON report alongside output")
     parser.add_argument("--quiet",     action="store_true")
     parser.add_argument("--project-dir", "-d", default=None,
-    help="Parent directory containing 'originals/' and 'mastered/' subfolders. "
-         "If not set, defaults to input file's parent directory.")
+        help="Parent directory containing 'originals/' and 'mastered/' subfolders. "
+             "If not set, defaults to input file's parent directory.")
     args = parser.parse_args()
 
-    input_path = Path(args.input)
+    input_path = Path(args.input).resolve()
     if not input_path.exists():
         print(red(f"Error: file not found: {input_path}"))
         sys.exit(1)
@@ -222,30 +222,34 @@ def main():
     platforms = list(PLATFORM_TARGETS.keys()) if args.platform == "all" else [args.platform]
     api_key   = args.api_key or os.environ.get("DEEPSEEK_API_KEY")
 
-    # Determine project directory and subfolders
+    # ------------------------------------------------------------------
+    # Determine project root and originals/mastered directories (FIXED)
+    # ------------------------------------------------------------------
     if args.project_dir:
-        project_dir = Path(args.project_dir).resolve()
-        originals_dir = project_dir / "originals"
-        mastered_dir  = project_dir / "mastered"
-        # Expect input inside originals/
-        if not input_path.is_relative_to(originals_dir):
-            print(f"Warning: input {input_path} is not inside {originals_dir}")
+        project_root = Path(args.project_dir).resolve()
     else:
-        project_dir = input_path.parent.resolve()
-        originals_dir = project_dir / "originals"
-        mastered_dir  = project_dir / "mastered"
+        # If input is already inside an 'originals' folder, use its parent as project root
+        if input_path.parent.name == "originals":
+            project_root = input_path.parent.parent.resolve()
+        else:
+            project_root = input_path.parent.resolve()
+
+    originals_dir = project_root / "originals"
+    mastered_dir  = project_root / "mastered"
 
     originals_dir.mkdir(parents=True, exist_ok=True)
     mastered_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optionally move input into originals/
+    # Move input into originals/ only if not already there
     target_input = originals_dir / input_path.name
-    if input_path.resolve() != target_input.resolve():
-        import shutil
+    if input_path != target_input:
         print(f"  Moving input to {target_input}")
         shutil.move(str(input_path), str(target_input))
         input_path = target_input
 
+    # ------------------------------------------------------------------
+    # Process each requested platform
+    # ------------------------------------------------------------------
     for platform in platforms:
         stem = input_path.stem
         suffix = f"_{platform}" if len(platforms) > 1 else "_mastered"
@@ -286,7 +290,6 @@ def main():
                 json.dump(data, f, indent=2, default=str)
             if not args.quiet:
                 print(f"  {dim('JSON saved to')} {json_path}\n")
-
 
 if __name__ == "__main__":
     main()
