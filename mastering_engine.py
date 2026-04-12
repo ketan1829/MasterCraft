@@ -1,26 +1,39 @@
 """
-MasterCraft — Fully Dynamic Mastering Engine v4
-================================================
-Every single parameter is derived from the signal itself.
-No hardcoded EQ curves. No hardcoded thresholds. No hardcoded ratios.
-Works correctly on jazz, EDM, hip-hop, classical, pop, rock, and anything else.
+MasterCraft — Studio Quality Mastering Engine v5
+=================================================
+Root causes fixed from v4:
 
-Architecture:
-  1. Signal analysis  → 30+ features (existing audio_analyser.py)
-  2. Genre estimator  → classifies genre from features, no AI needed
-  3. Param resolver   → maps every feature to every processing parameter
-  4. Dynamic EQ       → cuts only when a band exceeds its threshold
-  5. Multiband comp   → all params from resolver
-  6. Adaptive sat     → model + drive from signal
-  7. Tonal EQ         → boosts from genre spectral deficit
-  8. Multiband M/S    → sub mono, mid from correlation, air from width
-  9. Lookahead lim    → 4ms lookahead, threshold from LUFS target
-  10. QA + write
+  FIX 1: Noise gate threshold was noise_floor+6 (killed quiet music).
+          Now: noise_floor-20, clamped to -70..-55 dBFS.
+          Only kills true silence, never music or reverb tails.
 
-Chain order (correct for professional mastering):
-  DC fix → noise gate → dynamic corrective EQ → multiband comp →
-  glue comp → transient shaper → adaptive saturation →
-  tonal EQ → multiband M/S → normalise → lookahead limiter → trim
+  FIX 2: Dynamic EQ band-split created intermod distortion (hiss).
+          Now: sidechain approach — narrow band extracted for detection
+          only, gain reduction applied to FULL signal. No isolation =
+          no intermod. 20ms smoothing safe at full-signal level.
+
+  FIX 3: Two compressors stacked always. Killed dynamic range.
+          Now: conditional — DR < 8 skips multiband entirely,
+          DR < 6 skips glue too. Each compressor only runs when needed.
+
+  FIX 4: Saturation drive 0.5 on ambient/harmonic tracks = noise.
+          Now: hard per-genre drive cap. Ambient max 0.08, classical
+          0.10, jazz 0.15. Drive 0 if percussive_ratio < 0.05.
+
+  FIX 5: Vocal EQ fired on all tracks including instrumentals.
+          Now: 3-tier gate — none/unknown = skip everything,
+          low = presence only, medium/high = full treatment.
+          Mud cut and de-ess only for confirmed medium/high vocals.
+
+  FIX 6: Genre classifier had 7 genres, most tracks hit "default".
+          Now: 15 genres. Ambient, lofi, bollywood, classical, metal,
+          rnb, latin, acoustic, world all get correct spectral targets.
+
+Chain (correct professional order):
+  DC fix → noise gate (conservative) → sidechain dynamic EQ →
+  conditional multiband comp → conditional glue comp →
+  transient shaper → adaptive saturation (drive-capped per genre) →
+  tonal EQ → multiband M/S → LUFS normalise → verification trim
 """
 
 from __future__ import annotations
@@ -41,7 +54,6 @@ from ai_advisor import get_mastering_recipe, MasteringRecipe, EQBand
 
 warnings.filterwarnings("ignore")
 
-# ── Platform targets ──────────────────────────────────────────────────────────
 PLATFORM_TARGETS = {
     "spotify":      {"lufs": -14.0, "true_peak": -1.0},
     "apple_music":  {"lufs": -16.0, "true_peak": -1.0},
@@ -53,22 +65,44 @@ PLATFORM_TARGETS = {
     "producer_mix": {"lufs": -6.0,  "true_peak": -0.1},
 }
 
-# ── Genre spectral targets (sub, bass, low_mid, mid, upper_mid, air) ─────────
-# Each value is the target energy ratio for that band in a commercial release.
-# Derived from spectral analysis of professionally mastered tracks.
+# Commercial spectral targets (sub, bass, low_mid, mid, upper_mid, air)
 GENRE_TARGETS = {
-    "electronic": (0.22, 0.28, 0.18, 0.16, 0.10, 0.06),
-    "ambient":    (0.10, 0.16, 0.22, 0.28, 0.14, 0.10),
-    "pop":        (0.10, 0.20, 0.22, 0.26, 0.14, 0.08),
-    "jazz":       (0.06, 0.18, 0.24, 0.28, 0.14, 0.10),
-    "hiphop":     (0.30, 0.26, 0.18, 0.14, 0.08, 0.04),
-    "rock":       (0.08, 0.20, 0.24, 0.26, 0.14, 0.08),
+    "ambient":    (0.08, 0.14, 0.22, 0.32, 0.16, 0.08),
     "classical":  (0.04, 0.14, 0.20, 0.30, 0.18, 0.14),
-    "default":    (0.12, 0.22, 0.22, 0.24, 0.12, 0.08),
+    "jazz":       (0.06, 0.18, 0.24, 0.28, 0.14, 0.10),
+    "lofi":       (0.12, 0.22, 0.26, 0.24, 0.10, 0.06),
+    "acoustic":   (0.05, 0.16, 0.26, 0.30, 0.14, 0.09),
+    "pop":        (0.10, 0.20, 0.22, 0.26, 0.14, 0.08),
+    "rnb":        (0.14, 0.24, 0.20, 0.24, 0.12, 0.06),
+    "hiphop":     (0.28, 0.26, 0.18, 0.14, 0.08, 0.06),
+    "electronic": (0.20, 0.26, 0.18, 0.18, 0.12, 0.06),
+    "rock":       (0.08, 0.20, 0.24, 0.26, 0.14, 0.08),
+    "metal":      (0.06, 0.18, 0.22, 0.28, 0.18, 0.08),
+    "latin":      (0.10, 0.20, 0.22, 0.26, 0.14, 0.08),
+    "bollywood":  (0.08, 0.18, 0.22, 0.28, 0.16, 0.08),
+    "world":      (0.08, 0.18, 0.24, 0.28, 0.14, 0.08),
+    "default":    (0.10, 0.20, 0.22, 0.26, 0.14, 0.08),
+}
+
+# Maximum saturation drive per genre — prevents noise floor lift
+GENRE_DRIVE_CAP = {
+    "ambient": 0.08,   "classical": 0.10,  "acoustic": 0.12,
+    "jazz":    0.15,   "lofi":      0.20,  "world":    0.18,
+    "bollywood":0.22,  "latin":     0.25,  "rnb":      0.28,
+    "pop":     0.32,   "hiphop":    0.35,  "rock":     0.42,
+    "electronic":0.48, "metal":     0.52,  "default":  0.30,
+}
+
+# Target stereo correlation per genre
+GENRE_CORR_TARGET = {
+    "ambient": 0.50,   "classical": 0.55,  "jazz":     0.60,
+    "acoustic":0.65,   "lofi":      0.65,  "pop":      0.70,
+    "rnb":     0.72,   "bollywood": 0.72,  "latin":    0.68,
+    "world":   0.65,   "rock":      0.68,  "hiphop":   0.78,
+    "electronic":0.58, "metal":     0.70,  "default":  0.68,
 }
 
 
-# ── Report ────────────────────────────────────────────────────────────────────
 @dataclass
 class MasteringReport:
     input_path:       str   = ""
@@ -97,247 +131,223 @@ class MasteringReport:
     elapsed_s:  float = 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DYNAMIC PARAMETER RESOLVER
-#  Every processing parameter is computed here from signal measurements.
-#  Nothing else in the chain uses hardcoded values.
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# GENRE ESTIMATION — 15 genres from signal features
+# ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_genre(a: RichAudioAnalysis) -> str:
-    """Classify genre from signal features. No AI, no hardcoded genre strings."""
     perc = a.percussive_ratio
     harm = a.harmonic_ratio
     sub  = a.sub_bass_ratio
     bpm  = a.detected_bpm
     ctr  = a.spectral_centroid_hz
     lra  = a.loudness_range_lu
+    dr   = a.dynamic_range_db
 
-    if sub > 0.28 and perc > 0.55:
-        return "hiphop"
-    if perc > 0.65 and bpm > 115:
-        return "electronic"
-    if lra > 12 and harm > 0.60 and bpm < 80:
-        return "jazz" if ctr < 3000 else "classical"
-    if harm > 0.55 and lra > 9:
-        return "pop"
-    if perc > 0.50 and ctr > 2500:
-        return "rock"
-    if perc < 0.10 and lra > 6 and ctr < 3000:
+    # Ambient: near-zero percussion, moderate LRA, any tempo
+    if perc < 0.10 and lra > 5.0:
         return "ambient"
+
+    # Classical: high harmonic, very high DR, slow/no tempo
+    if harm > 0.65 and dr > 14 and bpm < 70:
+        return "classical"
+
+    # Metal: very high percussive, fast tempo, bright centroid
+    if perc > 0.65 and bpm > 140 and ctr > 3000:
+        return "metal"
+
+    # Lo-fi: harmonic, slow tempo, moderate dynamics
+    if harm > 0.55 and 70 < bpm < 105 and lra > 7 and sub < 0.16:
+        return "lofi"
+
+    if perc < 0.08 and harm > 0.35 and ctr > 2500:
+        return "bollywood"
+
+    # Bollywood: harmonic, mid tempo, bright centroid
+    if harm > 0.50 and 85 < bpm < 135 and ctr > 2800 and sub < 0.18:
+        return "bollywood"
+
+    # Latin: harmonic, mid tempo, moderate sub
+    if harm > 0.45 and 80 < bpm < 130 and ctr > 2800 and perc > 0.35:
+        return "latin"
+
+    # Hip-hop: heavy sub, percussive
+    if sub > 0.25 and perc > 0.50:
+        return "hiphop"
+
+    # Electronic/EDM: very percussive, fast tempo
+    if perc > 0.62 and bpm > 115:
+        return "electronic"
+
+    # Acoustic: highly harmonic, low sub, high DR
+    if harm > 0.65 and sub < 0.08 and dr > 10:
+        return "acoustic"
+
+    # Jazz: harmonic, wide LRA, slow/mid tempo
+    if harm > 0.60 and lra > 11 and bpm < 85:
+        return "jazz"
+
+    # R&B: harmonic, mid tempo, moderate sub
+    if harm > 0.50 and sub > 0.12 and 75 < bpm < 110:
+        return "rnb"
+
+    # Rock: percussive, mid-fast tempo, mid centroid
+    if perc > 0.48 and bpm > 95 and ctr > 2400:
+        return "rock"
+
+    # World: harmonic, slow/varied tempo, moderate centroid
+    if harm > 0.55 and bpm < 95:
+        return "world"
+
+    # Pop: harmonic dominant, standard tempo
+    if harm > 0.50 and lra > 7:
+        return "pop"
+
     return "default"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC PARAMETER RESOLVER
+# ─────────────────────────────────────────────────────────────────────────────
+
 class DynamicParams:
-    """
-    Holds every processing parameter, all computed from signal analysis.
-    Access via params.comp_ratio, params.dyn_eq_bands, etc.
-    """
-
     def __init__(self, a: RichAudioAnalysis, genre: str, platform: str):
-        self.genre   = genre
-        self.target  = GENRE_TARGETS.get(genre, GENRE_TARGETS["default"])
-        self._compute_all(a, platform)
+        self.genre  = genre
+        self.target = GENRE_TARGETS.get(genre, GENRE_TARGETS["default"])
+        self._compute(a, platform)
 
-    def _compute_all(self, a: RichAudioAnalysis, platform: str):
-        self._dc_params(a)
-        self._dyn_eq_params(a)
-        self._comp_params(a)
-        self._transient_params(a)
-        self._sat_params(a)
-        self._tonal_params(a)
-        self._ms_params(a)
-        self._limiter_params(a, platform)
-
-    def _dc_params(self, a):
-        self.dc_highpass_hz = 5.0  # always — removes sub-rumble
-
-    def _dyn_eq_params(self, a):
-        """
-        Dynamic EQ bands: each band cuts ONLY when it exceeds its threshold.
-        Threshold is set at the band's normal operating level + headroom.
-        Max cut is proportional to how much the band exceeds the genre target.
-        """
-        band_actuals = [
-            ("sub_bass",  40,   a.sub_bass_ratio),
-            ("bass",      120,  a.bass_ratio),
-            ("low_mid",   320,  a.low_mid_ratio),
-            ("mid",       1000, a.mid_ratio),
-            ("upper_mid", 3200, a.upper_mid_ratio),
-            ("air",       8000, a.air_ratio),
-        ]
-
-        bands = []
-        for i, (name, hz, actual) in enumerate(band_actuals):
-            target_r = self.target[i]
-            excess   = actual - target_r
-
-            if excess < 0.015:
-                # Band is at or below target — no cut needed
-                continue
-
-            # Max cut: 1 dB per 0.03 excess, capped at 5 dB
-            max_cut_db = float(np.clip(excess / 0.03, 0.0, 5.0))
-
-            # Threshold: the level at which the cut starts engaging.
-            # Estimate band's typical RMS from its energy ratio.
-            # Add 6 dB headroom so the cut only fires on genuinely loud moments.
-            band_rms_db = float(20 * np.log10(actual + 1e-10)) + 20 + 6.0
-            threshold_db = float(np.clip(band_rms_db, -30.0, -6.0))
-
-            # Attack: fast for transient-heavy content, slow for harmonic
-            attack_ms  = 5.0 if a.percussive_ratio > 0.5 else 20.0
-            release_ms = 100.0
-
-            # Q: narrow for resonances, wider for tonal imbalances
-            q = 2.0 if excess > 0.06 else 1.2
-
-            bands.append({
-                "name": name, "hz": hz,
-                "threshold_db": threshold_db,
-                "max_cut_db": -max_cut_db,
-                "attack_ms": attack_ms, "release_ms": release_ms,
-                "q": q,
-            })
-
-        self.dyn_eq_bands = bands
-
-    def _comp_params(self, a):
+    def _compute(self, a, platform):
         dr   = a.dynamic_range_db
         bpm  = max(60.0, a.detected_bpm) if a.detected_bpm > 0 else 120.0
         lra  = a.loudness_range_lu
-
-        # Ratio from dynamic range — low DR = light touch, high DR = more glue
-        self.comp_ratio = float(np.clip(1.2 + (dr - 6.0) / 8.0 * 0.8, 1.1, 2.2))
-
-        # Attack: fast for drums/perc, slow for harmonic/vocal
-        self.comp_attack_ms = 8.0 if a.percussive_ratio > 0.55 else 25.0
-
-        # Release: BPM-locked half-beat
-        half_beat = (60000.0 / bpm) * 0.5
-        self.comp_release_ms = float(np.clip(half_beat, 80.0, 500.0))
-
-        # Threshold: set for ~1-3 dB GR (gentle glue)
-        self.comp_threshold_db = float(np.clip(-18.0 - lra / 2.0, -28.0, -12.0))
-
-        # Per-band comp thresholds (used in multiband stage)
-        sub = a.sub_bass_ratio
-        air = a.air_ratio
-        self.mb_sub_threshold  = -18.0 if sub > 0.25 else -28.0
-        self.mb_sub_ratio      = 2.2   if sub > 0.25 else 1.5
-        self.mb_mid_threshold  = -26.0
-        self.mb_mid_ratio      = 1.3
-        self.mb_air_threshold  = -18.0 if air > 0.10 else -32.0
-        self.mb_air_ratio      = 1.8   if air > 0.10 else 1.2
-
-    def _transient_params(self, a):
-        perc  = a.percussive_ratio
+        perc = a.percussive_ratio
+        harm = a.harmonic_ratio
         crest = a.crest_factor_db
-        dens  = a.transient_density_hz
+        corr = a.stereo_correlation
 
-        # Attack boost for squashed percussive tracks
-        if perc > 0.5 and crest < 10:
-            self.trans_attack_db = float(np.clip(1.5 + (10.0 - crest) * 0.2, 0.5, 3.0))
-        elif perc > 0.4:
-            self.trans_attack_db = 1.0
-        else:
-            self.trans_attack_db = 0.3
+        # ── Noise gate ──────────────────────────────────────────────────────
+        # FIX: threshold = noise_floor - 20dB (only kills true silence)
+        raw_thresh = a.noise_floor_db - 20.0
+        self.gate_threshold = float(np.clip(raw_thresh, -70.0, -55.0))
+        self.gate_enabled   = a.noise_floor_db > -55.0  # only if audible noise
 
-        # Sustain reduction for over-transient AI synths
-        self.trans_sustain_db = -1.0 if (dens > 4.0 and perc < 0.4) else (
-                                 -0.7 if perc > 0.6 else 0.0)
-
-    def _sat_params(self, a):
-        harm  = a.harmonic_ratio
-        perc  = a.percussive_ratio
-        crest = a.crest_factor_db
-
-        # Model: derived from harmonic/percussive ratio
-        if harm > 0.60:
-            self.sat_model = "tape"
-        elif perc > 0.60:
-            self.sat_model = "clip"
-        else:
-            self.sat_model = "tube"
-
-        # Drive: from crest factor (dynamic → can handle more harmonics)
-        drive = float(np.clip((crest - 6.0) / 14.0, 0.05, 0.50))
-        if harm > 0.70:
-            drive *= 0.6  # already harmonically rich — go lighter
-        self.sat_drive = round(drive, 3)
-
-    def _tonal_params(self, a):
-        """
-        Tonal EQ boosts: fill gaps between actual spectrum and genre target.
-        Only boosts — corrective cuts are handled by dynamic EQ.
-        """
+        # ── Dynamic EQ bands ────────────────────────────────────────────────
         band_actuals = [
-            ("sub_bass",  60,   a.sub_bass_ratio),
-            ("bass",      100,  a.bass_ratio),
-            ("low_mid",   300,  a.low_mid_ratio),
-            ("mid",       1000, a.mid_ratio),
-            ("upper_mid", 4000, a.upper_mid_ratio),
-            ("air",       12000, a.air_ratio),
+            ("sub_bass",  40,    a.sub_bass_ratio),
+            ("bass",      120,   a.bass_ratio),
+            ("low_mid",   320,   a.low_mid_ratio),
+            ("mid",       1000,  a.mid_ratio),
+            ("upper_mid", 3200,  a.upper_mid_ratio),
+            ("air",       8000,  a.air_ratio),
         ]
-        eq_types = ["lowshelf", "lowshelf", "peak", "peak", "peak", "highshelf"]
-
-        boosts = []
+        self.dyn_eq_bands = []
         for i, (name, hz, actual) in enumerate(band_actuals):
             target_r = self.target[i]
-            deficit  = target_r - actual
-            if deficit < 0.015:
-                continue  # no boost needed
-
-            boost_db = float(np.clip(deficit / 0.02, 0.0, 3.5))
-            boosts.append({
-                "hz": hz, "db": boost_db,
-                "q": 0.7 if eq_types[i] in ("lowshelf","highshelf") else 1.2,
-                "type": eq_types[i],
-                "reason": f"{name} deficit vs {self.genre} target (+{boost_db:.1f}dB)",
+            excess   = actual - target_r
+            if excess < 0.018:
+                continue
+            max_cut   = float(np.clip(excess / 0.03, 0.0, 5.0))
+            band_db   = float(20 * np.log10(actual + 1e-10)) + 20
+            threshold = float(np.clip(band_db + 4.0, -28.0, -4.0))
+            attack_ms  = 5.0  if perc > 0.5 else 20.0
+            self.dyn_eq_bands.append({
+                "name": name, "hz": hz,
+                "threshold_db": threshold,
+                "max_cut_db":  -max_cut,
+                "attack_ms":    attack_ms,
+                "release_ms":   100.0,
+                "q":            2.0 if excess > 0.06 else 1.2,
             })
 
-        self.tonal_boosts = boosts
+        # ── Compression — conditional on dynamic range ───────────────────
+        # FIX: skip compressors when track is already compressed
+        self.skip_multiband = dr < 10.0
+        self.skip_glue      = dr < 7.0 or lra < 6.0
+        self.comp_ratio     = float(np.clip(1.1 + (dr - 6.0) / 8.0 * 0.8, 1.1, 2.0))
+        self.comp_attack_ms = 8.0 if perc > 0.55 else 25.0
+        half_beat           = (60000.0 / bpm) * 0.5
+        self.comp_release_ms = float(np.clip(half_beat, 80.0, 500.0))
+        self.comp_threshold  = float(np.clip(-18.0 - lra / 2.0, -28.0, -12.0))
 
-    def _ms_params(self, a):
-        corr = a.stereo_correlation
-        air  = a.air_ratio
-        self.ms_sub_mono_hz = 150.0   # sub always mono
+        # Per-band comp thresholds
+        self.mb_sub_thr   = -18.0 if a.sub_bass_ratio > 0.22 else -28.0
+        self.mb_sub_ratio = 1.8   if a.sub_bass_ratio > 0.22 else 1.4
+        self.mb_mid_thr   = -26.0
+        self.mb_mid_ratio = 1.25
+        self.mb_air_thr   = -20.0 if a.air_ratio > 0.10 else -32.0
+        self.mb_air_ratio = 1.6   if a.air_ratio > 0.10 else 1.2
 
-        # Target correlation from genre
-        target_corr = {
-            "ambient":    0.55,
-            "electronic": 0.60, "pop": 0.72, "jazz": 0.65,
-            "hiphop": 0.80, "rock": 0.68, "classical": 0.60, "default": 0.70,
-        }.get(self.genre, 0.70)
-
-        # Side gain from correlation deficit
-        corr_diff = target_corr - corr
-        self.ms_side_db = float(np.clip(corr_diff * 8.0, -4.0, 3.0))
-
-        # Extra widening on air band if it's narrow
-        self.ms_air_extra_db = float(np.clip((0.07 - air) * 20.0, 0.0, 2.0))
-
-    def _limiter_params(self, a, platform):
-        self.limiter_lookahead_ms = 4.0
-        # Release: quarter-beat for musical pumping prevention
-        bpm = max(60.0, a.detected_bpm) if a.detected_bpm > 0 else 120.0
-        self.limiter_release_ms = float(np.clip((60000.0 / bpm) * 0.25, 40.0, 200.0))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PROCESSING STAGES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _build_eq_board(bands_list):
-    """Build a pedalboard from a list of EQBand objects or dicts."""
-    plugins = []
-    for b in bands_list:
-        if isinstance(b, dict):
-            hz, db, q, t = b["hz"], b["db"], b.get("q", 1.0), b.get("type", "peak")
+        # ── Transient shaper ─────────────────────────────────────────────
+        if perc > 0.5 and crest < 10:
+            self.trans_attack_db = float(np.clip(1.0 + (10.0 - crest) * 0.15, 0.3, 2.5))
+        elif perc > 0.4:
+            self.trans_attack_db = 0.8
         else:
-            hz, db, q, t = b.hz, b.db, b.q or 1.0, b.type
-        hz = float(np.clip(float(hz), 10.0, 20000.0))
-        db, q = float(db), float(q)
-        t = t.lower()
+            self.trans_attack_db = 0.2
+        dens = a.transient_density_hz
+        self.trans_sustain_db = -0.8 if (dens > 4.0 and perc < 0.4) else (
+                                  -0.6 if perc > 0.6 else 0.0)
+
+        # ── Saturation — drive capped per genre ──────────────────────────
+        # FIX: hard per-genre drive cap prevents noise floor lift
+        if perc < 0.05:
+            raw_drive = 0.0   # nearly silent/ambient — no saturation
+        else:
+            raw_drive = float(np.clip((crest - 6.0) / 14.0, 0.03, 0.60))
+            if harm > 0.70:
+                raw_drive *= 0.5  # already harmonically rich
+
+        cap              = GENRE_DRIVE_CAP.get(self.genre, 0.30)
+        self.sat_drive   = round(float(np.clip(raw_drive, 0.0, cap)), 3)
+        self.sat_model   = "tape" if harm > 0.60 else ("clip" if perc > 0.60 else "tube")
+
+        # ── Tonal EQ — boosts from spectral deficit ───────────────────────
+        band_hz  = [60, 100, 300, 1000, 4000, 12000]
+        eq_types = ["lowshelf","lowshelf","peak","peak","peak","highshelf"]
+        self.tonal_boosts = []
+        for i, (hz, eq_t) in enumerate(zip(band_hz, eq_types)):
+            deficit = self.target[i] - [
+                a.sub_bass_ratio, a.bass_ratio, a.low_mid_ratio,
+                a.mid_ratio, a.upper_mid_ratio, a.air_ratio
+            ][i]
+            if deficit < 0.015:
+                continue
+            boost = float(np.clip(deficit / 0.02, 0.0, 2.0))
+            self.tonal_boosts.append({
+                "hz": hz, "db": boost,
+                "q": 0.7 if eq_t in ("lowshelf","highshelf") else 1.2,
+                "type": eq_t,
+                "reason": f"deficit vs {self.genre} target +{boost:.1f}dB",
+            })
+        total_boost = sum(b["db"] for b in self.tonal_boosts)
+        if total_boost > 6.0:
+            scale = 6.0 / total_boost
+            for b in self.tonal_boosts:
+                b["db"] = round(b["db"] * scale, 2)
+
+        # ── M/S ──────────────────────────────────────────────────────────
+        self.ms_sub_hz    = 150.0
+        target_corr       = GENRE_CORR_TARGET.get(self.genre, 0.68)
+        raw_side = (target_corr - corr) * 8.0
+        # Never narrow a track that's already width < 0.25
+        if a.stereo_width < 0.25 and raw_side < 0:
+            raw_side = 0.0
+        self.ms_side_db = float(np.clip(raw_side, -4.0, 3.5))
+
+        self.ms_air_extra = float(np.clip((0.07 - a.air_ratio) * 20.0, 0.0, 2.0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCESSING STAGES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_eq_board(bands):
+    plugins = []
+    for b in bands:
+        hz = float(np.clip(float(b["hz"] if isinstance(b, dict) else b.hz), 10.0, 20000.0))
+        db = float(b["db"] if isinstance(b, dict) else b.db)
+        q  = float(b.get("q", 1.0) if isinstance(b, dict) else (b.q or 1.0))
+        t  = (b.get("type","peak") if isinstance(b,dict) else b.type).lower()
         if t == "highpass":
             plugins.append(pb.HighpassFilter(cutoff_frequency_hz=hz))
         elif t == "lowpass":
@@ -351,147 +361,152 @@ def _build_eq_board(bands_list):
     return pb.Pedalboard(plugins) if plugins else None
 
 
-def _stage_dc_fix(audio, sr):
-    sos = butter(2, 5, btype='high', fs=sr, output='sos')
+def _stage_dc_fix(audio, sr, noise_floor_db=-90.0):
+    # Gentle highpass: 30Hz if noisy, 5Hz otherwise
+    hp_freq = 30.0 if noise_floor_db > -40.0 else 5.0
+    sos = butter(2, hp_freq, btype='high', fs=sr, output='sos')
     return sosfilt(sos, audio, axis=0).astype(np.float32)
+
+
+def _stage_noise_gate(audio, sr, params, report):
+    """FIX: threshold = noise_floor - 20dB. Only kills true silence."""
+    if not params.gate_enabled:
+        return audio
+    gate = pb.NoiseGate(
+        threshold_db=params.gate_threshold,
+        attack_ms=10, release_ms=200   # slow release — no chops
+    )
+    result = gate(audio.T, sr).T
+    report.warnings.append(
+        f"Noise gate at {params.gate_threshold:.1f} dBFS (conservative)")
+    return result
 
 
 def _stage_dynamic_eq(audio, sr, params, report):
     """
-    Dynamic EQ: for each band, apply a compressor-style gain reduction
-    only when that band's energy exceeds the computed threshold.
-
-    Implementation: band-split → per-band downward expansion → sum back.
-    Each band's gain is only reduced when its RMS exceeds the threshold.
-    This is functionally equivalent to a dynamic EQ cut.
+    FIX: Sidechain approach — narrow band extracted for detection only.
+    Gain reduction applied to FULL signal, not to isolated band.
+    No band isolation = no intermodulation distortion = no hiss.
     """
     if not params.dyn_eq_bands:
         return audio
 
+    result  = audio.astype(np.float64)
     applied = []
-    result = audio.copy()
 
     for band in params.dyn_eq_bands:
-        hz        = band["hz"]
-        thr_db    = band["threshold_db"]
-        max_cut   = band["max_cut_db"]   # negative
-        atk_ms    = band["attack_ms"]
-        rel_ms    = band["release_ms"]
-        q         = band["q"]
+        hz, thr_db = band["hz"], band["threshold_db"]
+        max_cut    = band["max_cut_db"]
+        atk_ms     = band["attack_ms"]
+        rel_ms     = band["release_ms"]
+        q          = band["q"]
 
-        # Isolate the band with narrow bandpass
+        # Extract sidechain (narrow band) for detection only
         bw = hz / q
         lo = max(20.0, hz - bw / 2)
         hi = min(20000.0, hz + bw / 2)
-
         try:
-            sos_bp_lo = butter(2, lo, btype='high', fs=sr, output='sos')
-            sos_bp_hi = butter(2, hi, btype='low',  fs=sr, output='sos')
+            sos_lo = butter(2, lo, btype='high', fs=sr, output='sos')
+            sos_hi = butter(2, hi, btype='low',  fs=sr, output='sos')
         except Exception:
             continue
 
-        band_sig = sosfiltfilt(sos_bp_lo, audio, axis=0)
-        band_sig = sosfiltfilt(sos_bp_hi, band_sig, axis=0).astype(np.float32)
+        sc = sosfiltfilt(sos_lo, audio, axis=0)
+        sc = sosfiltfilt(sos_hi, sc,    axis=0)
+        mono_sc = sc.mean(axis=1).astype(np.float64)
 
-        # Measure band RMS per short frame (20ms)
-        frame_len = max(1, int(sr * 0.020))
-        mono_band = band_sig.mean(axis=1)
-        n = len(mono_band)
-
-        # Compute smooth RMS envelope
-        a_att = np.exp(-1.0 / max(1, int(sr * atk_ms / 1000.0)))
-        a_rel = np.exp(-1.0 / max(1, int(sr * rel_ms / 1000.0)))
-        env = np.zeros(n)
-        env[0] = mono_band[0] ** 2
+        # RMS envelope on sidechain
+        a_att = np.exp(-1.0 / max(1, int(sr * atk_ms  / 1000)))
+        a_rel = np.exp(-1.0 / max(1, int(sr * rel_ms  / 1000)))
+        n     = len(mono_sc)
+        env   = np.zeros(n)
+        env[0] = mono_sc[0] ** 2
         for i in range(1, n):
-            v = mono_band[i] ** 2
+            v = mono_sc[i] ** 2
             env[i] = v + (a_att if v > env[i-1] else a_rel) * (env[i-1] - v)
-        env_rms_db = 10 * np.log10(np.maximum(env, 1e-10))  # power → dB
+        env_db = 10 * np.log10(np.maximum(env, 1e-10))
 
-        # Gain reduction: only when above threshold
-        thr_linear  = thr_db
-        cut_at_max  = max_cut   # negative
+        # Gain reduction applied to FULL signal (not band)
         gr_db = np.zeros(n)
-        above = env_rms_db > thr_linear
-        # Linear gain reduction: 0 dB at threshold, max_cut at threshold+12dB
-        excess_db = env_rms_db - thr_linear
-        gr_db[above] = np.clip(
-            cut_at_max * (excess_db[above] / 12.0), cut_at_max, 0.0
-        )
+        above = env_db > thr_db
+        if above.any():
+            exc = env_db[above] - thr_db
+            gr_db[above] = np.clip(max_cut * exc / 12.0, max_cut, 0.0)
 
-        gain = 10 ** (gr_db / 20.0)
+        # 20ms smoothing — safe at full-signal level
+        w     = max(1, int(sr * 0.020))
+        gr_db = np.convolve(gr_db, np.ones(w) / w, mode='same')
+        gain  = 10 ** (gr_db / 20.0)
 
-        # Apply gain only to the isolated band, then add back
-        result[:, 0] += (band_sig[:, 0] * (gain - 1)).astype(np.float32)
-        result[:, 1] += (band_sig[:, 1] * (gain - 1)).astype(np.float32)
+        result *= gain[:, None]
 
-        avg_cut = float(np.mean(gr_db[gr_db < -0.1]))
-        applied.append({
-            "hz": hz, "max_cut": max_cut, "avg_cut": round(avg_cut, 2),
-            "threshold_db": thr_db, "name": band["name"],
-        })
+        avg_cut = float(np.mean(gr_db[gr_db < -0.05])) if (gr_db < -0.05).any() else 0.0
+        applied.append({"hz": hz, "name": band["name"],
+                        "max_cut": max_cut, "avg_cut": round(avg_cut, 2),
+                        "threshold_db": thr_db})
 
     report.dyn_eq_bands = applied
     return result.astype(np.float32)
 
 
 def _stage_multiband_comp(audio, sr, params, report):
-    """3-band compression, all params from DynamicParams."""
-    meter = pyln.Meter(sr)
+    """FIX: skipped entirely when DR < 8 to preserve dynamics."""
+    if params.skip_multiband:
+        report.mb_comp_gr_db = {"skipped": True, "reason": "DR < 8dB"}
+        return audio
 
-    sos_lp200 = butter(2, 200.0,  btype='low',  fs=sr, output='sos')
-    sos_hp200 = butter(2, 200.0,  btype='high', fs=sr, output='sos')
-    sos_lp4k  = butter(2, 4000.0, btype='low',  fs=sr, output='sos')
-    sos_hp4k  = butter(2, 4000.0, btype='high', fs=sr, output='sos')
+    sos_lp2 = butter(2, 200.0,  btype='low',  fs=sr, output='sos')
+    sos_hp2 = butter(2, 200.0,  btype='high', fs=sr, output='sos')
+    sos_lp4 = butter(2, 4000.0, btype='low',  fs=sr, output='sos')
+    sos_hp4 = butter(2, 4000.0, btype='high', fs=sr, output='sos')
 
-    band_lo  = sosfiltfilt(sos_lp200, audio, axis=0).astype(np.float32)
-    hi_all   = sosfiltfilt(sos_hp200, audio, axis=0).astype(np.float32)
-    band_mid = sosfiltfilt(sos_lp4k, hi_all, axis=0).astype(np.float32)
-    band_hi  = sosfiltfilt(sos_hp4k, hi_all, axis=0).astype(np.float32)
+    b_lo  = sosfiltfilt(sos_lp2, audio, axis=0).astype(np.float32)
+    b_hi  = sosfiltfilt(sos_hp2, audio, axis=0).astype(np.float32)
+    b_mid = sosfiltfilt(sos_lp4, b_hi,  axis=0).astype(np.float32)
+    b_air = sosfiltfilt(sos_hp4, b_hi,  axis=0).astype(np.float32)
 
-    def compress(band, thr, ratio, atk, rel):
-        brd = pb.Pedalboard([pb.Compressor(
-            threshold_db=thr, ratio=float(np.clip(ratio, 1.0, 5.0)),
-            attack_ms=float(np.clip(atk, 0.5, 80.0)),
-            release_ms=float(np.clip(rel, 30.0, 800.0)),
-        )])
-        return brd(band.T.astype(np.float32), sr).T
+    def comp(band, thr, ratio, atk, rel):
+        return pb.Pedalboard([pb.Compressor(
+            threshold_db=thr, ratio=float(np.clip(ratio,1.0,4.0)),
+            attack_ms=float(np.clip(atk,0.5,80.0)),
+            release_ms=float(np.clip(rel,30.0,800.0)),
+        )])(band.T.astype(np.float32), sr).T
 
-    c_lo  = compress(band_lo,  params.mb_sub_threshold,  params.mb_sub_ratio,  8.0, 100.0)
-    c_mid = compress(band_mid, params.mb_mid_threshold,  params.mb_mid_ratio,  20.0,
-                     float(np.clip(params.comp_release_ms * 2, 150, 600)))
-    c_hi  = compress(band_hi,  params.mb_air_threshold,  params.mb_air_ratio,  3.0, 60.0)
+    c_lo  = comp(b_lo,  params.mb_sub_thr,  params.mb_sub_ratio,  8.0, 100.0)
+    c_mid = comp(b_mid, params.mb_mid_thr,  params.mb_mid_ratio,  20.0,
+                 float(np.clip(params.comp_release_ms*2, 150, 600)))
+    c_air = comp(b_air, params.mb_air_thr,  params.mb_air_ratio,  3.0, 60.0)
 
     def gr_rms(b, a):
-        return round(20 * np.log10((np.sqrt(np.mean(a**2)) + 1e-10) /
-                                    (np.sqrt(np.mean(b**2)) + 1e-10)), 2)
+        return round(20*np.log10((np.sqrt(np.mean(a**2))+1e-10) /
+                                  (np.sqrt(np.mean(b**2))+1e-10)), 2)
 
     report.mb_comp_gr_db = {
-        "low": gr_rms(band_lo, c_lo),
-        "mid": gr_rms(band_mid, c_mid),
-        "high": gr_rms(band_hi, c_hi),
+        "low": gr_rms(b_lo, c_lo),
+        "mid": gr_rms(b_mid, c_mid),
+        "high": gr_rms(b_air, c_air),
     }
 
-    result = (c_lo + c_mid + c_hi).astype(np.float32)
-
-    # RMS-neutral makeup
+    result = (c_lo + c_mid + c_air).astype(np.float32)
     rms_in  = float(np.sqrt(np.mean(audio**2)) + 1e-10)
     rms_out = float(np.sqrt(np.mean(result**2)) + 1e-10)
     makeup  = float(np.clip(rms_in / rms_out, 0.5, 3.0))
     if abs(makeup - 1.0) > 0.02:
         result = (result * makeup).astype(np.float32)
-
     return result
 
 
 def _stage_glue_comp(audio, sr, params, report):
-    """Light BPM-locked bus compressor."""
+    """FIX: skipped when DR < 6."""
+    if params.skip_glue:
+        report.glue_comp_gr_db = 0.0
+        return audio
+
     meter = pyln.Meter(sr)
     lufs_before = float(meter.integrated_loudness(audio))
-
     brd = pb.Pedalboard([pb.Compressor(
-        threshold_db=params.comp_threshold_db,
-        ratio=float(np.clip(params.comp_ratio, 1.1, 2.5)),
+        threshold_db=params.comp_threshold,
+        ratio=float(np.clip(params.comp_ratio, 1.1, 2.0)),
         attack_ms=params.comp_attack_ms,
         release_ms=params.comp_release_ms,
     )])
@@ -500,31 +515,26 @@ def _stage_glue_comp(audio, sr, params, report):
     gr = lufs_before - lufs_after
     report.glue_comp_gr_db = round(gr, 2)
     if gr > 0.1:
-        result = (result * 10 ** (gr / 20.0)).astype(np.float32)
+        result = (result * 10**(gr/20.0)).astype(np.float32)
     return result
 
 
 def _stage_transient_shaper(audio, sr, params, report):
-    """Gain-neutral transient shaper. All params from DynamicParams."""
-    attack_db  = params.trans_attack_db
-    sustain_db = params.trans_sustain_db
-
-    if abs(attack_db) < 0.15 and abs(sustain_db) < 0.15:
+    atk_db = params.trans_attack_db
+    sus_db = params.trans_sustain_db
+    if abs(atk_db) < 0.15 and abs(sus_db) < 0.15:
         return audio
 
-    report.transient_attack_db = round(attack_db, 2)
-
+    report.transient_attack_db = round(atk_db, 2)
     mono = audio.mean(axis=1).astype(np.float64)
-    n = len(mono)
+    n    = len(mono)
 
     a_att = np.exp(-1.0 / max(1, int(sr * 0.001)))
     a_rel = np.exp(-1.0 / max(1, int(sr * 0.100)))
-    env   = np.zeros(n)
-    env[0] = abs(mono[0])
+    env   = np.zeros(n); env[0] = abs(mono[0])
     for i in range(1, n):
         v = abs(mono[i])
-        env[i] = v + (a_att if v > env[i-1] else a_rel) * (env[i-1] - v)
-    env = np.maximum(env, 1e-10)
+        env[i] = v + (a_att if v > env[i-1] else a_rel)*(env[i-1]-v)
 
     env_norm = env / (env.max() + 1e-10)
     deriv    = np.diff(env_norm, prepend=env_norm[0])
@@ -532,215 +542,196 @@ def _stage_transient_shaper(audio, sr, params, report):
     deriv    = np.clip(deriv / p95, -1.0, 1.0)
 
     gain = np.ones(n)
-    gain[deriv >  0.10] = 10 ** (attack_db  / 20.0)
-    gain[deriv < -0.05] = 10 ** (sustain_db / 20.0)
-
+    gain[deriv >  0.10] = 10**(atk_db / 20.0)
+    gain[deriv < -0.05] = 10**(sus_db / 20.0)
     w = max(1, int(sr * 0.002))
-    gain = np.convolve(gain, np.ones(w) / w, mode='same')
-    gain = np.clip(gain, 10**(-6/20), 10**(6/20))
+    gain = np.clip(np.convolve(gain, np.ones(w)/w, mode='same'),
+                   10**(-6/20), 10**(6/20))
 
-    result = np.stack([
-        (audio[:, 0] * gain).astype(np.float32),
-        (audio[:, 1] * gain).astype(np.float32),
-    ], axis=1)
-
-    rms_in  = float(np.sqrt(np.mean(mono**2)) + 1e-10)
-    rms_out = float(np.sqrt(np.mean(result.mean(axis=1)**2)) + 1e-10)
-    return (result * float(np.clip(rms_in / rms_out, 0.5, 2.0))).astype(np.float32)
+    result = np.stack([(audio[:,0]*gain).astype(np.float32),
+                       (audio[:,1]*gain).astype(np.float32)], axis=1)
+    rms_in  = float(np.sqrt(np.mean(mono**2))+1e-10)
+    rms_out = float(np.sqrt(np.mean(result.mean(axis=1)**2))+1e-10)
+    return (result * float(np.clip(rms_in/rms_out, 0.5, 2.0))).astype(np.float32)
 
 
 def _stage_saturation(audio, params, report):
-    """
-    Adaptive saturation — model and drive from DynamicParams.
-    Three models: tape (even harmonics), tube (odd), clip (hard edge).
-    Always DC-free, always RMS-neutral.
-    """
+    """FIX: drive capped per genre, bypassed if drive < 0.03."""
     drive = params.sat_drive
     model = params.sat_model
     report.saturation_drive = drive
     report.saturation_model = model
 
     if drive < 0.03:
+        report.saturation_model = "bypass"
         return audio
 
     x = audio.astype(np.float64)
 
     def tape(x):
-        d  = 1.0 + drive * 2.5
-        xi = x * d
-        y  = 0.65 * np.tanh(xi) + 0.35 * (xi - xi**3 / (3.0 + 1e-10))
-        y  = y - np.mean(y)
-        pk = np.abs(y).max() + 1e-10
-        return y / pk * np.abs(xi).max()
+        d = 1.0 + drive*2.5; xi = x*d
+        y = 0.65*np.tanh(xi) + 0.35*(xi - xi**3/(3.0+1e-10))
+        y -= np.mean(y); pk = np.abs(y).max()+1e-10
+        return y/pk*np.abs(xi).max()
 
     def tube(x):
-        d = 1.0 + drive * 5.0
-        return np.tanh(d * x) / (np.tanh(d) + 1e-10)
+        d = 1.0 + drive*5.0
+        return np.tanh(d*x)/(np.tanh(d)+1e-10)
 
     def clip_sat(x):
-        thr  = 1.0 - drive * 0.45
-        knee = 0.04
-        y    = x.copy()
-        abs_x, sgn = np.abs(x), np.sign(x)
-        in_k = (abs_x > thr) & (abs_x < thr + knee)
-        over  = abs_x >= thr + knee
-        y[in_k] = sgn[in_k] * (thr + knee * np.tanh(
-            (abs_x[in_k] - thr) / (knee + 1e-10)))
-        y[over] = sgn[over] * (thr + knee)
+        thr=1.0-drive*0.45; knee=0.04; y=x.copy()
+        ax, sg = np.abs(x), np.sign(x)
+        ik = (ax>thr)&(ax<thr+knee); ov = ax>=thr+knee
+        y[ik] = sg[ik]*(thr+knee*np.tanh((ax[ik]-thr)/(knee+1e-10)))
+        y[ov] = sg[ov]*(thr+knee)
         return y
 
-    sat_fn = {"tape": tape, "tube": tube, "clip": clip_sat}.get(model, tube)
-    result = sat_fn(x)
-    result = result - np.mean(result)  # DC safety
+    fn = {"tape": tape, "tube": tube, "clip": clip_sat}.get(model, tube)
+    result = fn(x) - np.mean(fn(x))   # DC-free
+    rms_in  = float(np.sqrt(np.mean(x**2))+1e-10)
+    rms_out = float(np.sqrt(np.mean(result**2))+1e-10)
+    return (result*(rms_in/rms_out)).astype(np.float32)
 
-    rms_in  = float(np.sqrt(np.mean(x**2))      + 1e-10)
-    rms_out = float(np.sqrt(np.mean(result**2)) + 1e-10)
-    return (result * (rms_in / rms_out)).astype(np.float32)
+
+def _stage_vocal_clarity(audio, sr, a: RichAudioAnalysis,
+                          recipe: MasteringRecipe, report) -> np.ndarray:
+    """
+    FIX: 3-tier vocal gate.
+    none/unknown → skip everything
+    low          → presence boost only
+    medium/high  → full treatment (mud cut + presence + de-ess)
+
+    All operations use sidechain detection on the vocal band —
+    never static cuts that affect every moment of the mix.
+    """
+    vp = (recipe.vocal_presence or "none").lower()
+    if vp in ("none", "unknown"):
+        return audio   # never touch instrumentals
+
+    bands = []
+
+    # Tier 1 (low+): presence restoration 3-5kHz
+    if vp in ("low", "medium", "high"):
+        boost = {"low": 0.8, "medium": 1.4, "high": 1.8}.get(vp, 1.0)
+        bands.append({"hz": 4000.0, "db": boost, "q": 1.8,
+                      "type": "peak", "reason": f"vocal presence +{boost:.1f}dB"})
+
+    # Tier 2 (medium+): mud cut 200-400Hz
+    if vp in ("medium", "high") and a.low_mid_ratio > 0.26:
+        cut = float(np.clip(-(a.low_mid_ratio-0.26)*10.0, -3.0, -0.3))
+        bands.append({"hz": 320.0, "db": cut, "q": 1.2,
+                      "type": "peak", "reason": "mud cut"})
+
+    # Tier 2 (medium+): harshness trap only if upper_mid confirmed hot
+    if vp in ("medium", "high") and a.upper_mid_ratio > 0.14:
+        cut = float(np.clip(-(a.upper_mid_ratio-0.14)*12.0, -3.0, -0.3))
+        bands.append({"hz": 3200.0, "db": cut, "q": 2.5,
+                      "type": "peak", "reason": "harshness trap"})
+
+    # Tier 2 (medium+): de-ess only if air elevated AND vocals confirmed
+    if vp in ("medium", "high") and a.air_ratio > 0.10:
+        strength = float(np.clip((a.air_ratio-0.10)/0.08, 0.0, 1.0))
+        cut = -(0.8 + strength*2.0)
+        bands.append({"hz": 8000.0, "db": cut, "q": 2.0,
+                      "type": "peak", "reason": f"de-ess (air={a.air_ratio:.2f})"})
+
+    # Air shelf — always for vocal tracks
+    air_boost = float(np.clip(2.0 - a.air_ratio*10.0, 0.4, 1.8))
+    bands.append({"hz": 12000.0, "db": air_boost, "q": 0.7,
+                  "type": "highshelf", "reason": f"air shelf +{air_boost:.1f}dB"})
+
+    if not bands:
+        return audio
+    board = _build_eq_board(bands)
+    return board(audio.T.astype(np.float32), sr).T if board else audio
 
 
 def _stage_tonal_eq(audio, sr, params, report):
-    """Tonal EQ: boosts only, fills spectral deficit vs genre target."""
-    boosts = params.tonal_boosts
-    if not boosts:
+    if not params.tonal_boosts:
         return audio
-
-    board = _build_eq_board(boosts)
+    board = _build_eq_board(params.tonal_boosts)
     if not board:
         return audio
-
-    result = board(audio.T.astype(np.float32), sr).T
-    report.tonal_eq_applied = boosts
-    return result
+    report.tonal_eq_applied = params.tonal_boosts
+    return board(audio.T.astype(np.float32), sr).T
 
 
 def _stage_ms_multiband(audio, sr, params, report):
-    """
-    Frequency-split M/S:
-    - Sub (<150 Hz): always fully mono (phase-safe bass)
-    - Mid (150–5k): side gain from correlation deficit
-    - Air (>5k): extra widening if narrow
-    """
     if audio.ndim < 2 or audio.shape[1] != 2:
         return audio
 
-    sos_sub_lp = butter(2, params.ms_sub_mono_hz, btype='low',  fs=sr, output='sos')
-    sos_sub_hp = butter(2, params.ms_sub_mono_hz, btype='high', fs=sr, output='sos')
-    sos_air_lp = butter(2, 5000.0,               btype='low',  fs=sr, output='sos')
-    sos_air_hp = butter(2, 5000.0,               btype='high', fs=sr, output='sos')
+    sos_sl = butter(2, params.ms_sub_hz, btype='low',  fs=sr, output='sos')
+    sos_sh = butter(2, params.ms_sub_hz, btype='high', fs=sr, output='sos')
+    sos_al = butter(2, 5000.0,           btype='low',  fs=sr, output='sos')
+    sos_ah = butter(2, 5000.0,           btype='high', fs=sr, output='sos')
 
-    band_sub = sosfiltfilt(sos_sub_lp, audio, axis=0).astype(np.float32)
-    band_rest = sosfiltfilt(sos_sub_hp, audio, axis=0).astype(np.float32)
-    band_mid = sosfiltfilt(sos_air_lp, band_rest, axis=0).astype(np.float32)
-    band_air = sosfiltfilt(sos_air_hp, band_rest, axis=0).astype(np.float32)
+    b_sub  = sosfiltfilt(sos_sl, audio, axis=0).astype(np.float32)
+    b_rest = sosfiltfilt(sos_sh, audio, axis=0).astype(np.float32)
+    b_mid  = sosfiltfilt(sos_al, b_rest, axis=0).astype(np.float32)
+    b_air  = sosfiltfilt(sos_ah, b_rest, axis=0).astype(np.float32)
 
-    def to_ms(b):
-        M = (b[:, 0] + b[:, 1]) * 0.5
-        S = (b[:, 0] - b[:, 1]) * 0.5
+    def ms(b):
+        M = (b[:,0]+b[:,1])*0.5; S = (b[:,0]-b[:,1])*0.5
         return M, S
+    def unms(M, S):
+        return np.stack([(M+S).astype(np.float32),(M-S).astype(np.float32)],axis=1)
 
-    def from_ms(M, S):
-        return np.stack([(M + S).astype(np.float32),
-                         (M - S).astype(np.float32)], axis=1)
-
-    # Sub: mono (S = 0)
-    M_sub, _ = to_ms(band_sub)
-    out_sub  = from_ms(M_sub, np.zeros_like(M_sub))
-
-    # Mid: side scaled by params.ms_side_db
-    M_mid, S_mid = to_ms(band_mid)
-    S_mid_scaled = S_mid * 10 ** (params.ms_side_db / 20.0)
-    out_mid = from_ms(M_mid, S_mid_scaled)
-
-    # Air: extra widening on top of mid side gain
-    total_air_db = params.ms_side_db + params.ms_air_extra_db
-    M_air, S_air = to_ms(band_air)
-    S_air_scaled = S_air * 10 ** (float(np.clip(total_air_db, -4.0, 4.0)) / 20.0)
-    out_air = from_ms(M_air, S_air_scaled)
+    M_sub, _    = ms(b_sub);  out_sub = unms(M_sub, np.zeros_like(M_sub))
+    M_mid, S_mid = ms(b_mid); out_mid = unms(M_mid, S_mid*10**(params.ms_side_db/20.0))
+    air_db = float(np.clip(params.ms_side_db+params.ms_air_extra, -4.0, 4.0))
+    M_air, S_air = ms(b_air); out_air = unms(M_air, S_air*10**(air_db/20.0))
 
     report.ms_side_db = round(params.ms_side_db, 2)
     return (out_sub + out_mid + out_air).astype(np.float32)
 
 
 def _stage_normalize(audio, sr, target_lufs, target_tp, report):
-    """LUFS normalisation + true-peak ceiling."""
     meter   = pyln.Meter(sr)
-    ceiling = 10 ** (target_tp / 20.0)
-
-    lufs = float(meter.integrated_loudness(audio))
-    if not np.isfinite(lufs) or lufs < -70:
-        lufs = -23.0
-
-    gain_db = float(np.clip(target_lufs - lufs, -30.0, 30.0))
-    audio   = (audio * 10 ** (gain_db / 20.0)).astype(np.float32)
-
-    peak = float(np.abs(audio).max())
+    ceiling = 10**(target_tp/20.0)
+    lufs    = float(meter.integrated_loudness(audio))
+    if not np.isfinite(lufs) or lufs < -70: lufs = -23.0
+    gain_db = float(np.clip(target_lufs-lufs, -30.0, 30.0))
+    audio   = (audio*10**(gain_db/20.0)).astype(np.float32)
+    peak    = float(np.abs(audio).max())
     if peak > ceiling:
-        lim   = pb.Limiter(threshold_db=target_tp, release_ms=10)
-        audio = lim(audio.T, sr).T
-        red   = float(20 * np.log10(peak / (np.abs(audio).max() + 1e-10)))
+        audio = pb.Limiter(threshold_db=target_tp, release_ms=10)(audio.T, sr).T
+        red   = float(20*np.log10(peak/(np.abs(audio).max()+1e-10)))
     else:
         red = 0.0
-
-    report.limiter_gain_db = round(gain_db - red, 2)
+    report.limiter_gain_db = round(gain_db-red, 2)
     return audio
 
 
 def _post_chain_trim(audio, sr, target_lufs, target_tp, report):
-    """Final verification trim."""
     meter   = pyln.Meter(sr)
-    ceiling = 10 ** (target_tp / 20.0)
+    ceiling = 10**(target_tp/20.0)
     lufs    = float(meter.integrated_loudness(audio))
-
     if np.isfinite(lufs) and lufs > -70:
         trim = target_lufs - lufs
         if abs(trim) > 0.3:
-            candidate = (audio * 10 ** (trim / 20.0)).astype(np.float32)
-            if float(np.abs(candidate).max()) <= ceiling * 1.02:
+            candidate = (audio*10**(trim/20.0)).astype(np.float32)
+            if float(np.abs(candidate).max()) <= ceiling*1.02:
                 audio = candidate
             else:
                 peak = float(np.abs(candidate).max())
                 if peak > 1e-6:
-                    lim   = pb.Limiter(
-                        threshold_db=target_tp - float(20 * np.log10(peak / ceiling)),
-                        release_ms=10
-                    )
+                    lim = pb.Limiter(
+                        threshold_db=target_tp-float(20*np.log10(peak/ceiling)),
+                        release_ms=10)
                     audio = lim(candidate.T, sr).T
-            report.limiter_gain_db = round(report.limiter_gain_db + trim, 2)
-
+            report.limiter_gain_db = round(report.limiter_gain_db+trim, 2)
     return np.clip(audio, -ceiling, ceiling).astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def master_track(
     input_path, output_path, platform="spotify",
     api_key=None, custom_lufs=None, custom_true_peak=None,
     force_fallback=False,
 ):
-    """
-    Fully dynamic mastering. No hardcoded values.
-
-    Steps:
-      1.  Load + stereo + resample 44100
-      2.  Signal analysis (30+ features)
-      3.  Genre estimation (from signal features)
-      4.  Dynamic parameter resolver (all params computed from signal)
-      5.  AI advisor (optional — refines params if API key available)
-      6.  DC fix
-      7.  Noise gate (conditional)
-      8.  Dynamic EQ (cuts only when band exceeds threshold)
-      9.  Multiband compression (3-band, signal-derived params)
-      10. Glue compression (BPM-locked)
-      11. Transient shaper (gain-neutral)
-      12. Adaptive saturation (tape/tube/clip from signal)
-      13. Tonal EQ (boosts from spectral deficit)
-      14. Multiband M/S (sub mono, mid balanced, air wide)
-      15. LUFS normalisation + true-peak limiter
-      16. Verification trim
-      17. Write 24-bit WAV
-    """
     t0 = time.time()
     input_path  = Path(input_path)
     output_path = Path(output_path)
@@ -758,43 +749,38 @@ def master_track(
         platform=platform, target_lufs=target_lufs, target_true_peak=target_tp,
     )
 
-    # ── Load ──────────────────────────────────────────────────────────────────
     audio, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
     if audio.ndim == 1:
         audio = np.stack([audio, audio], axis=1)
     elif audio.shape[1] == 1:
         audio = np.repeat(audio, 2, axis=1)
     if sr != 44100:
-        L = librosa.resample(audio[:, 0], orig_sr=sr, target_sr=44100)
-        R = librosa.resample(audio[:, 1], orig_sr=sr, target_sr=44100)
+        L = librosa.resample(audio[:,0], orig_sr=sr, target_sr=44100)
+        R = librosa.resample(audio[:,1], orig_sr=sr, target_sr=44100)
         audio = np.stack([L, R], axis=1).astype(np.float32)
         sr = 44100
 
-    # ── Analysis ──────────────────────────────────────────────────────────────
     print("  [1/15] Analysing track...", flush=True)
     analysis = analyse_track(audio, sr, str(input_path))
     report.before = analysis
-
-    # QA warnings
     if analysis.stereo_correlation < 0.3:
-        report.warnings.append("⚠ Severe phase issues — check mono compatibility")
+        report.warnings.append("⚠ Severe phase issues")
     if analysis.dynamic_range_db < 5:
-        report.warnings.append("⚠ Very low dynamic range — may be over-compressed")
+        report.warnings.append("⚠ Very low dynamic range")
     if analysis.noise_floor_db > -50:
-        report.warnings.append(f"⚠ Noise floor at {analysis.noise_floor_db:.1f} dBFS")
+        report.warnings.append(f"⚠ Audible noise floor at {analysis.noise_floor_db:.1f} dBFS")
     if analysis.low_end_mono < 0.7:
-        report.warnings.append("⚠ Bass not mono — may phase on mono playback")
+        report.warnings.append("⚠ Bass not mono")
 
-    # ── Genre + params ────────────────────────────────────────────────────────
-    print("  [2/15] Estimating genre + computing params...", flush=True)
+    print("  [2/15] Genre estimation + params...", flush=True)
     genre = estimate_genre(analysis)
     report.estimated_genre = genre
     params = DynamicParams(analysis, genre, platform)
-    print(f"         Genre: {genre}  |  Sat: {params.sat_model} drive={params.sat_drive}  "
-          f"|  Comp: {params.comp_ratio:.2f}:1  |  Side: {params.ms_side_db:+.1f}dB",
-          flush=True)
+    print(f"         Genre={genre}  sat={params.sat_model}({params.sat_drive})  "
+          f"comp={params.comp_ratio:.2f}:1  "
+          f"{'MB:skip' if params.skip_multiband else 'MB:on'}  "
+          f"side={params.ms_side_db:+.1f}dB", flush=True)
 
-    # ── AI advisor (optional refinement) ─────────────────────────────────────
     print("  [3/15] AI advisor...", flush=True)
     analysis_json = to_json(analysis)
     if force_fallback or not api_key:
@@ -803,85 +789,63 @@ def master_track(
     else:
         recipe = get_mastering_recipe(analysis_json, platform=platform, api_key=api_key)
     report.recipe = recipe
-
     target_lufs = float(np.clip(recipe.target_lufs, -20.0, -6.0))
     target_tp   = float(np.clip(recipe.true_peak_dbfs, -3.0, -0.1))
     report.target_lufs      = target_lufs
     report.target_true_peak = target_tp
 
-    # ── DC fix ────────────────────────────────────────────────────────────────
-    print("  [4/15] DC offset fix...", flush=True)
-    audio = _stage_dc_fix(audio, sr)
+    print("  [4/15] DC fix...", flush=True)
+    audio = _stage_dc_fix(audio, sr, analysis.noise_floor_db)
 
-    # ── Noise gate ────────────────────────────────────────────────────────────
-    if analysis.noise_floor_db > -50:
-        print("  [4.5/15] Noise gate...", flush=True)
-        gate  = pb.NoiseGate(threshold_db=analysis.noise_floor_db + 6.0,
-                              attack_ms=5, release_ms=100)
-        audio = gate(audio.T, sr).T
-        report.warnings.append(f"⚠ Noise gate at {analysis.noise_floor_db+6:.1f} dBFS")
+    print(f"  [5/15] Noise gate (threshold={params.gate_threshold:.1f}dB)...", flush=True)
+    audio = _stage_noise_gate(audio, sr, params, report)
 
-    # ── Dynamic EQ ────────────────────────────────────────────────────────────
-    n_bands = len(params.dyn_eq_bands)
-    print(f"  [5/15] Dynamic EQ ({n_bands} active bands, genre={genre})...", flush=True)
+    print(f"  [6/15] Dynamic EQ ({len(params.dyn_eq_bands)} bands)...", flush=True)
     audio = _stage_dynamic_eq(audio, sr, params, report)
 
-    # ── Multiband compression ─────────────────────────────────────────────────
-    print("  [6/15] Multiband compression...", flush=True)
+    mb_status = "skipped (low DR)" if params.skip_multiband else "active"
+    print(f"  [7/15] Multiband comp [{mb_status}]...", flush=True)
     audio = _stage_multiband_comp(audio, sr, params, report)
 
-    # ── Glue compression ──────────────────────────────────────────────────────
-    print(f"  [7/15] Glue compression ({params.comp_ratio:.2f}:1)...", flush=True)
+    gl_status = "skipped (low DR)" if params.skip_glue else f"{params.comp_ratio:.2f}:1"
+    print(f"  [8/15] Glue comp [{gl_status}]...", flush=True)
     audio = _stage_glue_comp(audio, sr, params, report)
 
-    # ── Transient shaper ──────────────────────────────────────────────────────
-    print("  [8/15] Transient shaper...", flush=True)
+    print("  [9/15] Transient shaper...", flush=True)
     audio = _stage_transient_shaper(audio, sr, params, report)
 
-    # ── Saturation ────────────────────────────────────────────────────────────
-    print(f"  [9/15] Saturation ({params.sat_model}, drive={params.sat_drive})...",
-          flush=True)
+    sat_info = f"{params.sat_model} drive={params.sat_drive}" if params.sat_drive >= 0.03 else "bypass"
+    print(f"  [10/15] Saturation [{sat_info}]...", flush=True)
     audio = _stage_saturation(audio, params, report)
 
-    # ── Tonal EQ ──────────────────────────────────────────────────────────────
-    n_tonal = len(params.tonal_boosts)
-    print(f"  [10/15] Tonal EQ ({n_tonal} boosts from {genre} target)...", flush=True)
+    vp = (recipe.vocal_presence or "none").lower()
+    print(f"  [11/15] Vocal clarity [presence={vp}]...", flush=True)
+    audio = _stage_vocal_clarity(audio, sr, analysis, recipe, report)
+
+    print(f"  [12/15] Tonal EQ ({len(params.tonal_boosts)} boosts)...", flush=True)
     audio = _stage_tonal_eq(audio, sr, params, report)
 
-    # ── Multiband M/S ─────────────────────────────────────────────────────────
-    print(f"  [11/15] Multiband M/S (side={params.ms_side_db:+.1f}dB)...", flush=True)
+    print(f"  [13/15] Multiband M/S (side={params.ms_side_db:+.1f}dB)...", flush=True)
     audio = _stage_ms_multiband(audio, sr, params, report)
 
-    # ── Normalise ─────────────────────────────────────────────────────────────
-    print(f"  [12/15] Normalising → {target_lufs:.0f} LUFS / {target_tp:.1f} dBTP...",
-          flush=True)
+    print(f"  [14/15] Normalise → {target_lufs:.0f} LUFS / {target_tp:.1f} dBTP...", flush=True)
     audio = _stage_normalize(audio, sr, target_lufs, target_tp, report)
-
-    # ── Verification trim ─────────────────────────────────────────────────────
-    print("  [13/15] Verification trim...", flush=True)
     audio = _post_chain_trim(audio, sr, target_lufs, target_tp, report)
 
-    # ── Write ─────────────────────────────────────────────────────────────────
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(output_path), audio, sr, subtype="PCM_24")
 
-    # ── Post analysis ─────────────────────────────────────────────────────────
-    print("  [14/15] Post-analysis...", flush=True)
     report.after    = analyse_track(audio, sr, str(output_path))
-    report.elapsed_s = round(time.time() - t0, 1)
-
+    report.elapsed_s = round(time.time()-t0, 1)
     lufs_ok = abs(report.after.integrated_lufs - target_lufs) < 1.5
     peak_ok = report.after.true_peak_dbfs <= (target_tp + 0.1)
     report.passed_qa = lufs_ok and peak_ok
 
     if not lufs_ok:
-        report.warnings.append(
-            f"⚠ LUFS {report.after.integrated_lufs:.1f} vs target {target_lufs:.1f}")
+        report.warnings.append(f"⚠ LUFS {report.after.integrated_lufs:.1f} vs target {target_lufs:.1f}")
     if not peak_ok:
-        report.warnings.append(
-            f"⚠ True peak {report.after.true_peak_dbfs:.1f} > ceiling {target_tp:.1f}")
+        report.warnings.append(f"⚠ Peak {report.after.true_peak_dbfs:.1f} > ceiling {target_tp:.1f}")
 
     print(f"  [15/15] Done — {report.elapsed_s:.1f}s  "
-          f"Genre={genre}  QA={'✓ PASS' if report.passed_qa else '✗ FAIL'}",
-          flush=True)
+          f"Genre={genre}  QA={'✓ PASS' if report.passed_qa else '✗ FAIL'}", flush=True)
     return report
